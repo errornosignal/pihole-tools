@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#
+# pihole-api-auth
+#
+# Accepts user password and returns API sessionID
+
+read -rsp "Pi-hole password: " PW; echo; SID=$(curl -sk -X POST https://localhost/api/auth -H 'Content-Type: application/json' --data "{\"password\":\"$PW\"}" | jq -r '.session.sid'); unset PW; echo "SID obtained"

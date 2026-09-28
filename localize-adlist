@@ -1,0 +1,1657 @@
+#!/usr/bin/env bash
+#
+# pihole-localize-adlist
+#
+# Convert one existing Pi-hole remote adlist into a static local file while
+# preserving the original Pi-hole configuration until the replacement has
+# been independently verified.
+#
+# Usage:
+#   sudo ./localize-adlist <https://example.invalid/list.txt>
+#
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 022
+
+SCRIPT_NAME="pihole-localize-adlist"
+VERSION="1.3.4"
+
+PIHOLE_API="https://localhost"
+PIHOLE_DIR="/etc/pihole"
+GRAVITY_DB="$PIHOLE_DIR/gravity.db"
+CACHE_DIR="$PIHOLE_DIR/listsCache"
+STATE_DIR="/var/lib/pihole-localize"
+LIST_DIR="$STATE_DIR/lists"
+ARCHIVE_DIR="$STATE_DIR/archive"
+TXN_ROOT="$STATE_DIR/transactions"
+LOCK_FILE="/run/lock/pihole-localize-adlist.lock"
+MANAGED_PREFIX="Managed by pihole-localize-adlist | source="
+
+SID=""
+PW=""
+TARGET_URL=""
+TARGET_ID=""
+TARGET_TYPE=""
+TARGET_COMMENT=""
+TARGET_COMMENT_JSON="null"
+TARGET_GROUPS_JSON='[]'
+TARGET_ENABLED="false"
+TARGET_NUMBER="0"
+TARGET_STATUS="0"
+ORIGINAL_RECORD_JSON=""
+
+LOCAL_FILE=""
+LOCAL_URL=""
+LOCAL_COMMENT=""
+LOCAL_ID=""
+ORIGINAL_LOCAL_RECORD_JSON=""
+LOCAL_RECORD_EXISTED="false"
+LOCAL_FILE_EXISTED="false"
+LOCAL_FILE_READABLE_BY_PIHOLE="false"
+LOCAL_FILE_MODE=""
+LOCAL_FILE_UID=""
+LOCAL_FILE_GID=""
+LOCAL_RECORD_CREATED_BY_TXN="false"
+LOCAL_RECORD_MODIFIED_BY_TXN="false"
+LOCAL_FILE_CREATED_BY_TXN="false"
+LOCAL_FILE_MODIFIED_BY_TXN="false"
+LOCAL_TEST_ENABLED_BY_TXN="false"
+
+OLD_DISABLED_BY_TXN="false"
+OLD_DELETED_BY_TXN="false"
+
+SOURCE_FILE=""
+SOURCE_METHOD=""
+SOURCE_DESCRIPTION=""
+SOURCE_SHA256=""
+
+ARCHIVE=""
+ARCHIVE_SHA256=""
+
+TXN_DIR=""
+TXN_STATE=""
+TXN_STATUS=""
+ROLLBACK_GRAVITY_REQUIRED="false"
+MIGRATION_ACTIVE="false"
+ROLLBACK_IN_PROGRESS="false"
+COMMITTED="false"
+
+LOCK_FD=""
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+info() {
+    printf '[INFO] %s\n' "$*"
+}
+
+warn() {
+    printf '[WARN] %s\n' "$*" >&2
+}
+
+error() {
+    printf '[ERROR] %s\n' "$*" >&2
+}
+
+die() {
+    error "$*"
+    return 1
+}
+
+usage() {
+    cat <<EOF2
+Usage:
+  sudo ./localize-adlist <https://example.invalid/list.txt>
+
+Description:
+  Migrate one existing Pi-hole remote adlist to a static local file under
+  /var/lib/pihole-localize/lists/, validate it with pihole -g, and only then
+  ask whether the old remote adlist should be deleted.
+
+The script is intentionally interactive for:
+  - recovery of interrupted transactions
+  - orphaned managed local-list handling
+  - fallback to an existing local snapshot
+  - final deletion of the old remote adlist
+
+Source acquisition order:
+  1. Existing Pi-hole cache for the target adlist
+  2. Direct download from the target URL
+  3. Existing local snapshot, with explicit approval
+
+The script never runs pihole -g to populate a missing cache and never changes
+Pi-hole-managed permissions under /etc/pihole.
+
+Verification uses:
+  - gravity output for the exact local file:// target
+  - parsed exact/ABP counts
+  - gravity/antigravity rows associated with the new adlist ID
+  - Pi-hole API counts and configuration
+
+Version: $VERSION
+EOF2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+check_root() {
+    [[ "$EUID" -eq 0 ]] || die "Run as root, e.g. sudo $0 <URL>"
+    id pihole >/dev/null 2>&1 || die "Pi-hole user 'pihole' was not found"
+}
+
+check_dependencies() {
+    local cmd
+    for cmd in bash curl jq pihole pihole-FTL tar sha256sum find sort mktemp awk sed tr cut date flock install getent stat wc runuser grep hostname id dirname head; do
+        require_cmd "$cmd"
+    done
+
+    [[ -f "$GRAVITY_DB" ]] || die "Pi-hole gravity database not found: $GRAVITY_DB"
+    [[ -d "$CACHE_DIR" ]] || die "Pi-hole cache directory not found: $CACHE_DIR"
+    [[ -d "$STATE_DIR" ]] || mkdir -p "$STATE_DIR"
+    [[ -d "$LIST_DIR" ]] || mkdir -p "$LIST_DIR"
+    [[ -d "$ARCHIVE_DIR" ]] || mkdir -p "$ARCHIVE_DIR"
+    [[ -d "$TXN_ROOT" ]] || mkdir -p "$TXN_ROOT"
+}
+
+acquire_lock() {
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec {LOCK_FD}>"$LOCK_FILE"
+    if ! flock -n "$LOCK_FD"; then
+        die "Another $SCRIPT_NAME transaction is already running"
+    fi
+}
+
+url_encode() {
+    printf '%s' "$1" | jq -sRr @uri
+}
+
+api_get_all_lists() {
+    curl -skS --fail \
+        -H "X-FTL-SID: $SID" \
+        "$PIHOLE_API/api/lists"
+}
+
+api_find_exact_record() {
+    local address="$1"
+    local type_filter="${2:-}"
+    local json
+
+    json="$(api_get_all_lists)" || return 1
+
+    if [[ -n "$type_filter" ]]; then
+        jq -c --arg a "$address" --arg t "$type_filter" '
+            [.lists[] | select(.address == $a and .type == $t)]
+            | if length == 0 then empty
+              elif length == 1 then .[0]
+              else error("multiple matching adlists")
+              end
+        ' <<<"$json"
+    else
+        jq -c --arg a "$address" '
+            [.lists[] | select(.address == $a)]
+            | if length == 0 then empty
+              elif length == 1 then .[0]
+              else error("multiple matching adlists")
+              end
+        ' <<<"$json"
+    fi
+}
+
+api_expect_success() {
+    local response="$1"
+    if ! jq -e '((.processed.errors // []) | length == 0)' <<<"$response" >/dev/null; then
+        error "Pi-hole API reported an error:"
+        jq -r '.processed.errors[]? | tostring' <<<"$response" >&2 || true
+        return 1
+    fi
+}
+
+api_authenticate() {
+    local auth_json
+
+    read -rsp "Pi-hole password: " PW
+    printf '\n'
+
+    auth_json="$(
+        jq -n --arg password "$PW" '{password:$password}' |
+        curl -skS --fail \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            --data @- \
+            "$PIHOLE_API/api/auth"
+    )" || {
+        unset PW
+        die "Pi-hole API authentication failed"
+    }
+
+    unset PW
+    SID="$(jq -r '.session.sid // empty' <<<"$auth_json")"
+    [[ -n "$SID" ]] || die "Pi-hole API did not return a session SID"
+    info "Authenticated to local Pi-hole API"
+}
+
+logout_api() {
+    if [[ -n "$SID" ]]; then
+        curl -skS -X DELETE \
+            -H "X-FTL-SID: $SID" \
+            "$PIHOLE_API/api/auth" >/dev/null 2>&1 || true
+    fi
+    SID=""
+}
+
+validate_target_url() {
+    [[ "$TARGET_URL" =~ ^https?://[^[:space:]]+$ ]] || die "Target must be an HTTP(S) URL: $TARGET_URL"
+}
+
+make_local_filename() {
+    local url="$1"
+    local no_scheme
+    local safe
+    local hash
+
+    no_scheme="${url#http://}"
+    no_scheme="${no_scheme#https://}"
+    safe="$(printf '%s' "$no_scheme" | tr '/:?&=%#@+;' '_' | tr -cs 'A-Za-z0-9._-' '_')"
+    safe="${safe##_}"
+    safe="${safe%%_}"
+    [[ -n "$safe" ]] || safe="adlist"
+
+    if (( ${#safe} > 210 )); then
+        hash="$(printf '%s' "$url" | sha256sum | awk '{print substr($1,1,12)}')"
+        safe="${safe:0:195}_$hash.txt"
+    elif [[ "$safe" != *.txt ]]; then
+        safe="${safe}.txt"
+    fi
+
+    printf '%s' "$safe"
+}
+
+make_local_path() {
+    printf '%s/%s' "$LIST_DIR" "$(make_local_filename "$1")"
+}
+
+make_managed_comment() {
+    printf '%s%s' "$MANAGED_PREFIX" "$TARGET_URL"
+}
+
+pihole_can_read_file() {
+    local path="$1"
+    runuser -u pihole -- test -r "$path" >/dev/null 2>&1
+}
+
+load_target_record() {
+    local record
+    local local_candidate
+    local local_candidate_record
+    local local_comment
+    local local_type
+
+    record="$(api_find_exact_record "$TARGET_URL" || true)"
+    if [[ -z "$record" ]]; then
+        local_candidate="$(make_local_path "$TARGET_URL")"
+        local_candidate="file://$local_candidate"
+        local_comment=""
+        local_type=""
+        local_candidate_record="$(api_find_exact_record "$local_candidate" || true)"
+        if [[ -n "$local_candidate_record" ]]; then
+            local_comment="$(jq -r '.comment // ""' <<<"$local_candidate_record")"
+            local_type="$(jq -r '.type // empty' <<<"$local_candidate_record")"
+            if [[ "$local_comment" == "$MANAGED_PREFIX"* ]]; then
+                if pihole_can_read_file "${local_candidate#file://}"; then
+                    info "Target remote adlist is already absent and its managed local replacement is active: $local_candidate"
+                    exit 0
+                fi
+                die "Target adlist is absent, but its managed local replacement exists and its backing file is missing or unreadable: ${local_candidate#file://}"
+            fi
+        fi
+        die "Target adlist not found in Pi-hole: $TARGET_URL"
+    fi
+
+    TARGET_ID="$(jq -r '.id' <<<"$record")"
+    TARGET_TYPE="$(jq -r '.type' <<<"$record")"
+    TARGET_COMMENT="$(jq -r '.comment // ""' <<<"$record")"
+    TARGET_COMMENT_JSON="$(jq -c '.comment' <<<"$record")"
+    TARGET_GROUPS_JSON="$(jq -c '.groups // [0]' <<<"$record")"
+    TARGET_ENABLED="$(jq -r 'if .enabled then "true" else "false" end' <<<"$record")"
+    TARGET_NUMBER="$(jq -r '.number // 0' <<<"$record")"
+    TARGET_STATUS="$(jq -r '.status // 0' <<<"$record")"
+    ORIGINAL_RECORD_JSON="$record"
+
+    info "Target adlist #$TARGET_ID found"
+    info "Type: $TARGET_TYPE"
+    info "Enabled: $TARGET_ENABLED"
+    info "Pi-hole's current number: $TARGET_NUMBER"
+    info "Pi-hole's current status: $TARGET_STATUS"
+    info "Groups: $TARGET_GROUPS_JSON"
+}
+
+capture_existing_local_record() {
+    local any_local
+    local existing_comment
+    local existing_type
+    local answer
+
+    LOCAL_FILE="$(make_local_path "$TARGET_URL")"
+    LOCAL_URL="file://$LOCAL_FILE"
+    LOCAL_COMMENT="$(make_managed_comment)"
+
+    if [[ -f "$LOCAL_FILE" ]]; then
+        LOCAL_FILE_EXISTED="true"
+        LOCAL_FILE_MODE="$(stat -c '%a' "$LOCAL_FILE")"
+        LOCAL_FILE_UID="$(stat -c '%u' "$LOCAL_FILE")"
+        LOCAL_FILE_GID="$(stat -c '%g' "$LOCAL_FILE")"
+    else
+        LOCAL_FILE_EXISTED="false"
+        LOCAL_FILE_MODE=""
+        LOCAL_FILE_UID=""
+        LOCAL_FILE_GID=""
+    fi
+
+    if [[ -f "$LOCAL_FILE" ]] && pihole_can_read_file "$LOCAL_FILE"; then
+        LOCAL_FILE_READABLE_BY_PIHOLE="true"
+    else
+        LOCAL_FILE_READABLE_BY_PIHOLE="false"
+    fi
+
+    any_local="$(api_find_exact_record "$LOCAL_URL" || true)"
+
+    if [[ -n "$any_local" ]]; then
+        LOCAL_RECORD_EXISTED="true"
+        ORIGINAL_LOCAL_RECORD_JSON="$any_local"
+        LOCAL_ID="$(jq -r '.id' <<<"$any_local")"
+
+        existing_comment="$(jq -r '.comment // ""' <<<"$any_local")"
+        existing_type="$(jq -r '.type // empty' <<<"$any_local")"
+
+        [[ "$existing_type" == "$TARGET_TYPE" ]] ||
+            die "Existing local adlist #$LOCAL_ID has type '$existing_type', expected '$TARGET_TYPE'"
+
+        if [[ "$existing_comment" != "$MANAGED_PREFIX"* ]]; then
+            read -rp "A local adlist already exists at $LOCAL_URL but is not managed by this utility. Adopt it? [y/N] " answer
+            [[ "$answer" =~ ^[Yy]$ ]] || die "Aborted: refusing to modify an unmanaged local adlist"
+        fi
+
+        if [[ "$LOCAL_FILE_READABLE_BY_PIHOLE" != "true" ]]; then
+            echo
+            warn "Managed local adlist #$LOCAL_ID exists, but its backing file is missing or not readable by the pihole user."
+            warn "This may be an orphaned or damaged state from an interrupted/older migration."
+            read -rp "Rebuild/repair this managed local replacement from the secured source during this transaction? [y/N] " answer
+            [[ "$answer" =~ ^[Yy]$ ]] || die "Aborted: leaving the existing local adlist untouched"
+            info "Treating existing managed local adlist #$LOCAL_ID as repairable orphaned state"
+        else
+            info "Existing local adlist #$LOCAL_ID detected"
+        fi
+    else
+        LOCAL_RECORD_EXISTED="false"
+        ORIGINAL_LOCAL_RECORD_JSON=""
+    fi
+}
+
+find_cache_file() {
+    local path
+    local line
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        path="${line#* }"
+        [[ -f "$path" ]] || continue
+        [[ -s "$path" ]] || continue
+        printf '%s' "$path"
+        return 0
+    done < <(
+        find "$CACHE_DIR" -maxdepth 1 -type f -name "list.${TARGET_ID}.*.domains" -printf '%T@ %p\n' 2>/dev/null |
+            sort -nr
+    )
+
+    return 1
+}
+
+try_direct_download() {
+    local dest="$1"
+
+    curl -fsSL --location --compressed \
+        --retry 2 --retry-delay 1 --retry-all-errors \
+        --connect-timeout 10 \
+        --max-time 60 \
+        "$TARGET_URL" \
+        -o "$dest"
+
+    [[ -s "$dest" ]]
+}
+
+choose_source() {
+    local cache_file=""
+    local candidate_local=""
+    local answer
+    local cache_mtime=""
+
+    SOURCE_FILE="$TXN_DIR/source.txt"
+
+    if cache_file="$(find_cache_file)"; then
+        cache_mtime="$(date -d "$(stat -c '%y' "$cache_file")" '+%F %T %Z' 2>/dev/null || stat -c '%y' "$cache_file")"
+        cp -- "$cache_file" "$SOURCE_FILE"
+        SOURCE_METHOD="pihole-cache"
+        SOURCE_DESCRIPTION="Pi-hole cache $cache_file (mtime $cache_mtime)"
+        info "Using existing Pi-hole cache: $cache_file"
+        info "Cache timestamp: $cache_mtime"
+        return 0
+    fi
+
+    info "No cached copy found for old adlist #$TARGET_ID"
+    info "Attempting direct download from $TARGET_URL"
+
+    if try_direct_download "$SOURCE_FILE"; then
+        SOURCE_METHOD="direct-download"
+        SOURCE_DESCRIPTION="Direct download from $TARGET_URL"
+        info "Direct download succeeded"
+        return 0
+    fi
+
+    rm -f -- "$SOURCE_FILE"
+    warn "Direct download failed"
+
+    candidate_local="$LOCAL_FILE"
+    if [[ -f "$candidate_local" && -s "$candidate_local" ]]; then
+        echo
+        warn "A local snapshot exists at: $candidate_local"
+        warn "It may be stale. It will be used exactly as-is if you approve."
+        read -rp "Use this existing local snapshot? [y/N] " answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            cp -- "$candidate_local" "$SOURCE_FILE"
+            SOURCE_METHOD="existing-local-snapshot"
+            SOURCE_DESCRIPTION="Existing local snapshot at $candidate_local (user-approved fallback)"
+            info "Using user-approved existing local snapshot"
+            return 0
+        fi
+    fi
+
+    die "Unable to secure a source snapshot. Nothing has been changed in Pi-hole."
+}
+
+validate_source_file() {
+    local bytes
+    local lines
+    local last_byte
+
+    [[ -s "$SOURCE_FILE" ]] || die "Source snapshot is empty"
+
+    # Conservative guard against saving an HTML/error document in place of a list.
+    if grep -Eiq '<!doctype html|<html|<head|<body|access denied|request rejected|<error' "$SOURCE_FILE"; then
+        die "Source snapshot looks like an HTML/error response; refusing to install it"
+    fi
+
+    # Normalize the snapshot so every installed local list ends with a final
+    # newline. Do this before hashing/archiving so the archive, active file,
+    # and verification checksum all describe the exact same bytes.
+    last_byte="$(tail -c 1 "$SOURCE_FILE" | od -An -t x1 | tr -d ' \n')"
+    if [[ "$last_byte" != "0a" ]]; then
+        printf '\n' >> "$SOURCE_FILE"
+        info "Normalized source snapshot: appended final newline"
+    fi
+
+    bytes="$(wc -c < "$SOURCE_FILE")"
+    lines="$(wc -l < "$SOURCE_FILE")"
+    info "Source snapshot: $bytes bytes, $lines newline-terminated lines"
+
+    SOURCE_SHA256="$(sha256sum "$SOURCE_FILE" | awk '{print $1}')"
+}
+
+restore_record_body() {
+    jq '{address:.address, comment:.comment, groups:(.groups // [0]), enabled:(.enabled // false)}'
+}
+
+local_adlist_body() {
+    jq -n \
+        --arg address "$LOCAL_URL" \
+        --arg comment "$LOCAL_COMMENT" \
+        --argjson groups "$TARGET_GROUPS_JSON" \
+        --arg enabled "$TARGET_ENABLED" \
+        '{address:$address, comment:$comment, groups:$groups, enabled:($enabled == "true")}'
+}
+
+local_adlist_body_enabled() {
+    local enabled="$1"
+    jq -n \
+        --arg address "$LOCAL_URL" \
+        --arg comment "$LOCAL_COMMENT" \
+        --argjson groups "$TARGET_GROUPS_JSON" \
+        --arg enabled "$enabled" \
+        '{address:$address, comment:$comment, groups:$groups, enabled:($enabled == "true")}'
+}
+
+remote_adlist_body_enabled() {
+    local enabled="$1"
+    jq -n \
+        --arg address "$TARGET_URL" \
+        --argjson comment "$TARGET_COMMENT_JSON" \
+        --argjson groups "$TARGET_GROUPS_JSON" \
+        --arg enabled "$enabled" \
+        '{address:$address, comment:$comment, groups:$groups, enabled:($enabled == "true")}'
+}
+
+api_put_record() {
+    local address="$1"
+    local type="$2"
+    local body="$3"
+    local encoded
+    local response
+
+    encoded="$(url_encode "$address")"
+    response="$(curl -skS --fail \
+        -X PUT \
+        -H "X-FTL-SID: $SID" \
+        -H 'Content-Type: application/json' \
+        --data "$body" \
+        "$PIHOLE_API/api/lists/$encoded?type=$(url_encode "$type")")" || return 1
+
+    api_expect_success "$response" || return 1
+}
+
+api_post_record() {
+    local type="$1"
+    local body="$2"
+    local response
+
+    response="$(curl -skS --fail \
+        -X POST \
+        -H "X-FTL-SID: $SID" \
+        -H 'Content-Type: application/json' \
+        --data "$body" \
+        "$PIHOLE_API/api/lists?type=$(url_encode "$type")")" || return 1
+
+    api_expect_success "$response" || return 1
+    printf '%s' "$response"
+}
+
+api_delete_record() {
+    local address="$1"
+    local type="$2"
+    local encoded
+    local response
+
+    encoded="$(url_encode "$address")"
+    response="$(curl -skS --fail \
+        -X DELETE \
+        -H "X-FTL-SID: $SID" \
+        "$PIHOLE_API/api/lists/$encoded?type=$(url_encode "$type")")" || return 1
+
+    api_expect_success "$response" || return 1
+}
+
+new_transaction() {
+    local stamp
+    local base
+    local suffix=1
+
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    base="$TXN_ROOT/$stamp"
+    TXN_DIR="$base"
+    while [[ -e "$TXN_DIR" ]]; do
+        TXN_DIR="${base}-${suffix}"
+        ((suffix += 1))
+    done
+
+    mkdir -p "$TXN_DIR"
+    TXN_STATE="$TXN_DIR/state.json"
+    touch "$TXN_DIR/.keep"
+    TXN_STATUS="prepared"
+    ROLLBACK_GRAVITY_REQUIRED="false"
+    MIGRATION_ACTIVE="false"
+}
+
+activate_transaction() {
+    TXN_STATUS="active"
+    MIGRATION_ACTIVE="true"
+    journal_write
+}
+
+journal_write() {
+    local tmp="$TXN_STATE.tmp"
+    local target_obj='null'
+    local local_obj='null'
+
+    [[ -n "$TXN_STATE" ]] || return 0
+
+    if [[ -n "$ORIGINAL_RECORD_JSON" ]]; then
+        target_obj="$ORIGINAL_RECORD_JSON"
+    fi
+    if [[ -n "$ORIGINAL_LOCAL_RECORD_JSON" ]]; then
+        local_obj="$ORIGINAL_LOCAL_RECORD_JSON"
+    fi
+
+    jq -n \
+        --arg version "$VERSION" \
+        --arg status "$TXN_STATUS" \
+        --arg created "$(date --iso-8601=seconds)" \
+        --arg target_url "$TARGET_URL" \
+        --arg target_id "$TARGET_ID" \
+        --arg target_type "$TARGET_TYPE" \
+        --arg local_file "$LOCAL_FILE" \
+        --arg local_url "$LOCAL_URL" \
+        --arg local_id "$LOCAL_ID" \
+        --arg target_enabled "$TARGET_ENABLED" \
+        --arg target_groups "$TARGET_GROUPS_JSON" \
+        --arg source_method "$SOURCE_METHOD" \
+        --arg source_description "$SOURCE_DESCRIPTION" \
+        --arg source_file "$SOURCE_FILE" \
+        --arg source_sha256 "$SOURCE_SHA256" \
+        --arg archive "$ARCHIVE" \
+        --arg archive_sha256 "$ARCHIVE_SHA256" \
+        --arg local_record_existed "$LOCAL_RECORD_EXISTED" \
+        --arg local_file_existed "$LOCAL_FILE_EXISTED" \
+        --arg local_file_readable "$LOCAL_FILE_READABLE_BY_PIHOLE" \
+        --arg local_file_mode "$LOCAL_FILE_MODE" \
+        --arg local_file_uid "$LOCAL_FILE_UID" \
+        --arg local_file_gid "$LOCAL_FILE_GID" \
+        --arg local_record_created "$LOCAL_RECORD_CREATED_BY_TXN" \
+        --arg local_record_modified "$LOCAL_RECORD_MODIFIED_BY_TXN" \
+        --arg local_file_created "$LOCAL_FILE_CREATED_BY_TXN" \
+        --arg local_file_modified "$LOCAL_FILE_MODIFIED_BY_TXN" \
+        --arg local_test_enabled "$LOCAL_TEST_ENABLED_BY_TXN" \
+        --arg old_disabled "$OLD_DISABLED_BY_TXN" \
+        --arg old_deleted "$OLD_DELETED_BY_TXN" \
+        --arg rollback_gravity "$ROLLBACK_GRAVITY_REQUIRED" \
+        --arg migration_changed "$MIGRATION_ACTIVE" \
+        --argjson target_record "$target_obj" \
+        --argjson local_record "$local_obj" \
+        '{
+            version:$version,
+            status:$status,
+            created:$created,
+            target_url:$target_url,
+            target_id:$target_id,
+            target_type:$target_type,
+            target_enabled:($target_enabled == "true"),
+            target_groups:( $target_groups | fromjson ),
+            target_record:$target_record,
+            local_file:$local_file,
+            local_url:$local_url,
+            local_id:$local_id,
+            local_record_existed:($local_record_existed == "true"),
+            local_record:$local_record,
+            local_file_existed:($local_file_existed == "true"),
+            local_file_readable_by_pihole:($local_file_readable == "true"),
+            local_file_mode:$local_file_mode,
+            local_file_uid:$local_file_uid,
+            local_file_gid:$local_file_gid,
+            local_record_created_by_txn:($local_record_created == "true"),
+            local_record_modified_by_txn:($local_record_modified == "true"),
+            local_file_created_by_txn:($local_file_created == "true"),
+            local_file_modified_by_txn:($local_file_modified == "true"),
+            local_test_enabled_by_txn:($local_test_enabled == "true"),
+            old_disabled_by_txn:($old_disabled == "true"),
+            old_deleted_by_txn:($old_deleted == "true"),
+            rollback_gravity_required:($rollback_gravity == "true"),
+            source_method:$source_method,
+            source_description:$source_description,
+            source_file:$source_file,
+            source_sha256:$source_sha256,
+            archive:$archive,
+            archive_sha256:$archive_sha256,
+            migration_active:($migration_changed == "true")
+        }' > "$tmp"
+
+    mv -f -- "$tmp" "$TXN_STATE"
+}
+
+journal_mark() {
+    local status="$1"
+    local tmp="$TXN_STATE.tmp"
+    jq --arg status "$status" '.status=$status | .last_updated=(now | todateiso8601)' \
+        "$TXN_STATE" > "$tmp"
+    mv -f -- "$tmp" "$TXN_STATE"
+}
+
+find_active_transaction() {
+    local candidate
+    local matches=()
+
+    [[ -d "$TXN_ROOT" ]] || return 1
+
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        if jq -e '.status == "active"' "$candidate" >/dev/null 2>&1; then
+            matches+=("$candidate")
+        fi
+    done < <(find "$TXN_ROOT" -mindepth 2 -maxdepth 2 -type f -name state.json -print 2>/dev/null | sort)
+
+    (( ${#matches[@]} > 0 )) || return 1
+    (( ${#matches[@]} == 1 )) || die "Multiple unfinished transactions found under $TXN_ROOT; resolve them manually"
+    printf '%s' "${matches[0]}"
+}
+
+load_transaction_journal() {
+    local state_file="$1"
+    local dir
+
+    TXN_STATE="$state_file"
+    TXN_STATUS="$(jq -r '.status // "active"' "$state_file")"
+    dir="$(dirname "$state_file")"
+    TXN_DIR="$dir"
+
+    TARGET_URL="$(jq -r '.target_url' "$state_file")"
+    TARGET_ID="$(jq -r '.target_id' "$state_file")"
+    TARGET_TYPE="$(jq -r '.target_type' "$state_file")"
+    TARGET_ENABLED="$(jq -r 'if .target_enabled then "true" else "false" end' "$state_file")"
+    TARGET_GROUPS_JSON="$(jq -c '.target_groups // [0]' "$state_file")"
+    ORIGINAL_RECORD_JSON="$(jq -c '.target_record' "$state_file")"
+
+    LOCAL_FILE="$(jq -r '.local_file' "$state_file")"
+    LOCAL_URL="$(jq -r '.local_url' "$state_file")"
+    LOCAL_ID="$(jq -r '.local_id // ""' "$state_file")"
+    LOCAL_RECORD_EXISTED="$(jq -r 'if .local_record_existed then "true" else "false" end' "$state_file")"
+    ORIGINAL_LOCAL_RECORD_JSON="$(jq -c '.local_record // empty' "$state_file" 2>/dev/null || true)"
+    LOCAL_FILE_EXISTED="$(jq -r 'if .local_file_existed then "true" else "false" end' "$state_file")"
+    LOCAL_FILE_MODE="$(jq -r '.local_file_mode // ""' "$state_file")"
+    LOCAL_FILE_UID="$(jq -r '.local_file_uid // ""' "$state_file")"
+    LOCAL_FILE_GID="$(jq -r '.local_file_gid // ""' "$state_file")"
+    LOCAL_RECORD_CREATED_BY_TXN="$(jq -r 'if .local_record_created_by_txn then "true" else "false" end' "$state_file")"
+    LOCAL_RECORD_MODIFIED_BY_TXN="$(jq -r 'if .local_record_modified_by_txn then "true" else "false" end' "$state_file")"
+    LOCAL_FILE_CREATED_BY_TXN="$(jq -r 'if .local_file_created_by_txn then "true" else "false" end' "$state_file")"
+    LOCAL_FILE_MODIFIED_BY_TXN="$(jq -r 'if .local_file_modified_by_txn then "true" else "false" end' "$state_file")"
+    LOCAL_TEST_ENABLED_BY_TXN="$(jq -r 'if .local_test_enabled_by_txn then "true" else "false" end' "$state_file")"
+    OLD_DISABLED_BY_TXN="$(jq -r 'if .old_disabled_by_txn then "true" else "false" end' "$state_file")"
+    OLD_DELETED_BY_TXN="$(jq -r 'if .old_deleted_by_txn then "true" else "false" end' "$state_file")"
+    ROLLBACK_GRAVITY_REQUIRED="$(jq -r 'if .rollback_gravity_required then "true" else "false" end' "$state_file")"
+    SOURCE_FILE="$(jq -r '.source_file // empty' "$state_file")"
+    SOURCE_METHOD="$(jq -r '.source_method // empty' "$state_file")"
+    SOURCE_DESCRIPTION="$(jq -r '.source_description // empty' "$state_file")"
+    SOURCE_SHA256="$(jq -r '.source_sha256 // empty' "$state_file")"
+    ARCHIVE="$(jq -r '.archive // empty' "$state_file")"
+    ARCHIVE_SHA256="$(jq -r '.archive_sha256 // empty' "$state_file")"
+
+    TARGET_COMMENT="$(jq -r '.target_record.comment // ""' <<<"$ORIGINAL_RECORD_JSON")"
+    TARGET_COMMENT_JSON="$(jq -c '.target_record.comment' "$state_file")"
+    LOCAL_COMMENT="$(make_managed_comment)"
+}
+
+recover_unfinished_transaction() {
+    local state_file
+    local answer
+
+    state_file="$(find_active_transaction || true)"
+    [[ -n "$state_file" ]] || return 0
+
+    load_transaction_journal "$state_file"
+
+    echo
+    warn "An unfinished $SCRIPT_NAME transaction was found."
+    echo "  Target : $TARGET_URL"
+    echo "  Local  : $LOCAL_URL"
+    echo "  State  : $TXN_STATE"
+    echo
+    read -rp "Attempt to roll back this unfinished transaction now? [Y/n] " answer
+    if [[ "$answer" =~ ^[Nn]$ ]]; then
+        die "Refusing to start a new migration while an unfinished transaction exists"
+    fi
+
+    MIGRATION_ACTIVE="true"
+    ROLLBACK_IN_PROGRESS="true"
+    rollback_transaction "Recovery of unfinished transaction"
+    ROLLBACK_IN_PROGRESS="false"
+    MIGRATION_ACTIVE="false"
+
+    if [[ -f "$TXN_STATE" ]] && jq -e '.status == "rolledback"' "$TXN_STATE" >/dev/null 2>&1; then
+        info "Unfinished transaction successfully rolled back"
+    else
+        die "Recovery rollback could not be verified"
+    fi
+
+    TARGET_URL=""
+    TARGET_ID=""
+    TARGET_TYPE=""
+    ORIGINAL_RECORD_JSON=""
+    LOCAL_FILE=""
+    LOCAL_URL=""
+    LOCAL_ID=""
+    ORIGINAL_LOCAL_RECORD_JSON=""
+    TXN_DIR=""
+    TXN_STATE=""
+}
+
+build_archive() {
+    local archive_work="$TXN_DIR/archive-content"
+    local manifest="$archive_work/MANIFEST.txt"
+    local prior_sha=""
+    local archive_base
+    local suffix=1
+
+    mkdir -p "$archive_work"
+    cp -- "$SOURCE_FILE" "$archive_work/source.txt"
+    jq '.' <<<"$ORIGINAL_RECORD_JSON" > "$archive_work/original-target-record.json"
+
+    if [[ -n "$ORIGINAL_LOCAL_RECORD_JSON" ]]; then
+        jq '.' <<<"$ORIGINAL_LOCAL_RECORD_JSON" > "$archive_work/original-local-record.json"
+    fi
+
+    if [[ "$LOCAL_FILE_EXISTED" == "true" && -f "$LOCAL_FILE" ]]; then
+        cp -- "$LOCAL_FILE" "$archive_work/prior-local-snapshot.txt"
+        prior_sha="$(sha256sum "$LOCAL_FILE" | awk '{print $1}')"
+        cp -- "$LOCAL_FILE" "$TXN_DIR/prior-local-snapshot.txt"
+    fi
+
+    {
+        echo "$SCRIPT_NAME version $VERSION"
+        echo "Created: $(date --iso-8601=seconds)"
+        echo "Hostname: $(hostname)"
+        echo
+        echo "Target URL: $TARGET_URL"
+        echo "Target ID: $TARGET_ID"
+        echo "Target type: $TARGET_TYPE"
+        echo "Target enabled before migration: $TARGET_ENABLED"
+        echo "Target groups: $TARGET_GROUPS_JSON"
+        echo "Target comment: $TARGET_COMMENT"
+        echo
+        echo "Local file: $LOCAL_FILE"
+        echo "Local URL: $LOCAL_URL"
+        echo "Local record existed before migration: $LOCAL_RECORD_EXISTED"
+        echo "Local file existed before migration: $LOCAL_FILE_EXISTED"
+        echo "Local file readable by pihole before migration: $LOCAL_FILE_READABLE_BY_PIHOLE"
+        echo
+        echo "Source method: $SOURCE_METHOD"
+        echo "Source description: $SOURCE_DESCRIPTION"
+        echo "Source SHA256: $SOURCE_SHA256"
+        if [[ -n "$prior_sha" ]]; then
+            echo "Prior local snapshot SHA256: $prior_sha"
+        fi
+        echo
+        echo "Pi-hole version:"
+        pihole -v 2>&1 || true
+    } > "$manifest"
+
+    printf '%s\n' "$TARGET_GROUPS_JSON" > "$archive_work/original-groups.json"
+
+    archive_base="migration-$(date +%Y%m%d-%H%M%S)"
+    ARCHIVE="$ARCHIVE_DIR/${archive_base}.tar.gz"
+    while [[ -e "$ARCHIVE" ]]; do
+        ARCHIVE="$ARCHIVE_DIR/${archive_base}-${suffix}.tar.gz"
+        ((suffix += 1))
+    done
+
+    tar -C "$archive_work" -czf "$ARCHIVE" .
+    tar -tzf "$ARCHIVE" >/dev/null
+    ARCHIVE_SHA256="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+
+    cp -- "$manifest" "$TXN_DIR/MANIFEST.txt"
+    printf '%s\n' "$ARCHIVE_SHA256" > "$TXN_DIR/archive.sha256"
+
+    info "Pre-change archive created: $ARCHIVE"
+    info "Archive SHA256: $ARCHIVE_SHA256"
+    journal_write
+}
+
+install_local_snapshot() {
+    local staged="$TXN_DIR/local-snapshot.staged"
+
+    mkdir -p "$LIST_DIR"
+
+    if [[ -L "$LOCAL_FILE" ]]; then
+        die "Refusing to operate on symlink: $LOCAL_FILE"
+    fi
+
+    if [[ "$LOCAL_FILE_EXISTED" == "true" && -f "$LOCAL_FILE" ]]; then
+        cp -- "$LOCAL_FILE" "$TXN_DIR/prior-local-file-before-overwrite.txt"
+        LOCAL_FILE_MODIFIED_BY_TXN="true"
+        info "Replacing existing local snapshot: $LOCAL_FILE"
+    else
+        LOCAL_FILE_CREATED_BY_TXN="true"
+    fi
+
+    ROLLBACK_GRAVITY_REQUIRED="true"
+
+    # Journal the intended file action before changing the file itself so a
+    # hard interruption still leaves enough information for recovery.
+    journal_write
+
+    cp -- "$SOURCE_FILE" "$staged"
+    install -o root -g root -m 0644 "$staged" "$LOCAL_FILE"
+    journal_write
+
+    pihole_can_read_file "$LOCAL_FILE" || die "pihole cannot read installed local snapshot"
+    info "Installed local snapshot: $LOCAL_FILE"
+}
+
+configure_local_adlist() {
+    local response
+    local created_record
+    local body
+
+    LOCAL_COMMENT="$(make_managed_comment)"
+
+    if [[ "$LOCAL_RECORD_EXISTED" == "true" ]]; then
+        body="$(local_adlist_body)"
+        info "Updating existing local adlist #$LOCAL_ID to managed metadata"
+        LOCAL_RECORD_MODIFIED_BY_TXN="true"
+        # Record the pending mutation before the API call.
+        journal_write
+        api_put_record "$LOCAL_URL" "$TARGET_TYPE" "$body" || die "Failed to update local adlist #$LOCAL_ID"
+        journal_write
+    else
+        LOCAL_RECORD_CREATED_BY_TXN="true"
+        # Record the pending creation before the API call.
+        journal_write
+        response="$(api_post_record "$TARGET_TYPE" "$(local_adlist_body)")" || die "Failed to create local adlist"
+        created_record="$(jq -c '.lists[0]' <<<"$response")"
+        [[ -n "$created_record" && "$created_record" != "null" ]] || die "Pi-hole did not return the created local adlist"
+        LOCAL_ID="$(jq -r '.id' <<<"$created_record")"
+        journal_write
+        info "Created local adlist #$LOCAL_ID"
+    fi
+}
+
+verify_local_record_config() {
+    local record
+    local address
+    local type
+    local groups
+    local comment
+    local enabled
+
+    record="$(api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE" || true)"
+    [[ -n "$record" ]] || die "Local adlist record is missing"
+
+    LOCAL_ID="$(jq -r '.id' <<<"$record")"
+    address="$(jq -r '.address' <<<"$record")"
+    type="$(jq -r '.type' <<<"$record")"
+    groups="$(jq -c '.groups // []' <<<"$record")"
+    comment="$(jq -r '.comment // ""' <<<"$record")"
+    enabled="$(jq -r 'if .enabled then "true" else "false" end' <<<"$record")"
+
+    [[ "$address" == "$LOCAL_URL" ]] || die "Local adlist address mismatch"
+    [[ "$type" == "$TARGET_TYPE" ]] || die "Local adlist type mismatch"
+    [[ "$groups" == "$TARGET_GROUPS_JSON" ]] || die "Local adlist group assignment mismatch"
+    [[ "$comment" == "$LOCAL_COMMENT" ]] || die "Local adlist managed comment mismatch"
+
+    if [[ "$TARGET_ENABLED" == "true" ]]; then
+        [[ "$enabled" == "true" ]] || die "Local adlist is not enabled as expected"
+    fi
+
+    journal_write
+    info "Local adlist #$LOCAL_ID is configured correctly"
+}
+
+normalize_gravity_log() {
+    local input="$1"
+    local output="$2"
+    sed -E $'s/\x1B\[[0-9;?]*[ -\/]*[@-~]//g' "$input" > "$output"
+}
+
+parse_gravity_counts() {
+    local normalized="$1"
+    local target="$2"
+
+    awk -v target="$target" '
+        index($0, "[i] Target: " target) > 0 {
+            in_target=1
+            local_seen=0
+            next
+        }
+        in_target && index($0, "[i] Target: ") > 0 {
+            exit
+        }
+        in_target && index($0, "[i] Using local file ") > 0 {
+            local_seen=1
+            next
+        }
+        in_target && local_seen && match($0, /Parsed [0-9]+ exact domains and [0-9]+ ABP-style domains/) {
+            line=substr($0, RSTART, RLENGTH)
+            gsub(/[^0-9]+/, " ", line)
+            sub(/^ +/, "", line)
+            sub(/ +$/, "", line)
+            print line
+            exit
+        }
+    ' "$normalized"
+}
+
+run_gravity() {
+    local raw="$TXN_DIR/gravity-$(date +%Y%m%d-%H%M%S).log"
+    local normalized="$TXN_DIR/gravity-normalized.log"
+
+    info "Running controlled gravity rebuild"
+    if ! pihole -g 2>&1 | tee "$raw"; then
+        error "pihole -g failed"
+        return 1
+    fi
+
+    normalize_gravity_log "$raw" "$normalized"
+
+    grep -F "[i] Target: $LOCAL_URL" "$normalized" >/dev/null || {
+        error "Gravity output did not contain expected local target: $LOCAL_URL"
+        return 1
+    }
+
+    grep -F "[i] Using local file $LOCAL_FILE" "$normalized" >/dev/null || {
+        error "Gravity output did not confirm use of local file: $LOCAL_FILE"
+        return 1
+    }
+
+    grep -F "[✓] Status: Retrieval successful" "$normalized" >/dev/null ||
+        grep -F "Status: Retrieval successful" "$normalized" >/dev/null || {
+        error "Gravity output did not confirm successful retrieval of the local source"
+        return 1
+    }
+
+    return 0
+}
+
+query_gravity_count() {
+    local table="$1"
+    local id="$2"
+
+    [[ "$id" =~ ^[0-9]+$ ]] || return 1
+    pihole-FTL sqlite3 -ni "$GRAVITY_DB" \
+        "SELECT COUNT(*) FROM ${table} WHERE adlist_id = ${id};" 2>/dev/null
+}
+
+query_gravity_unique_count() {
+    local table="$1"
+    local id="$2"
+
+    [[ "$id" =~ ^[0-9]+$ ]] || return 1
+    pihole-FTL sqlite3 -ni "$GRAVITY_DB" \
+        "SELECT COUNT(DISTINCT domain) FROM ${table} WHERE adlist_id = ${id};" 2>/dev/null
+}
+
+verify_gravity_for_local() {
+    local normalized="$1"
+    local counts
+    local parsed_exact
+    local parsed_abp
+    local gravity_table
+    local gravity_count
+    local gravity_unique
+    local record
+    local api_number
+    local api_abp
+    local api_status
+    local api_enabled
+    local api_groups
+    local local_sha
+
+    counts="$(parse_gravity_counts "$normalized" "$LOCAL_URL")"
+    [[ "$counts" =~ ^[0-9]+[[:space:]][0-9]+$ ]] || {
+        error "Could not find a valid local-file parse record for: $LOCAL_URL"
+        return 1
+    }
+
+    parsed_exact="${counts%% *}"
+    parsed_abp="${counts##* }"
+    info "Gravity parsed $parsed_exact exact domains and $parsed_abp ABP-style domains from $LOCAL_URL"
+
+    if [[ "$TARGET_TYPE" == "block" ]]; then
+        gravity_table="gravity"
+    else
+        gravity_table="antigravity"
+    fi
+
+    gravity_count="$(query_gravity_count "$gravity_table" "$LOCAL_ID")" || {
+        error "Could not query $gravity_table for local adlist #$LOCAL_ID"
+        return 1
+    }
+    gravity_unique="$(query_gravity_unique_count "$gravity_table" "$LOCAL_ID")" || {
+        error "Could not query unique domains in $gravity_table for local adlist #$LOCAL_ID"
+        return 1
+    }
+
+    [[ "$gravity_count" == "$parsed_exact" ]] || {
+        error "Gravity table count mismatch for #$LOCAL_ID: parsed $parsed_exact exact domains, but $gravity_table contains $gravity_count rows"
+        return 1
+    }
+    info "$gravity_table contains $gravity_count rows ($gravity_unique unique) for local adlist #$LOCAL_ID"
+
+    record="$(api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE" || true)"
+    [[ -n "$record" ]] || {
+        error "Local adlist record missing after gravity"
+        return 1
+    }
+
+    LOCAL_ID="$(jq -r '.id' <<<"$record")"
+    api_number="$(jq -r '.number // -1' <<<"$record")"
+    api_abp="$(jq -r '.abp_entries // -1' <<<"$record")"
+    api_status="$(jq -r '.status // 0' <<<"$record")"
+    api_enabled="$(jq -r 'if .enabled then "true" else "false" end' <<<"$record")"
+    api_groups="$(jq -c '.groups // []' <<<"$record")"
+
+    # Pi-hole's adlist number/abp_entries fields are not used as the
+    # authoritative verification for file:// migrations. The parser output
+    # and the actual gravity/antigravity rows associated with LOCAL_ID are
+    # authoritative. Keep the API metadata visible for diagnostics.
+    info "Pi-hole API metadata after gravity: number=$api_number, abp_entries=$api_abp, status=$api_status"
+
+    [[ "$api_groups" == "$TARGET_GROUPS_JSON" ]] || {
+        error "Local adlist group assignment changed: expected $TARGET_GROUPS_JSON, got $api_groups"
+        return 1
+    }
+
+    case "$api_status" in
+        1|2)
+            info "Pi-hole adlist status: $api_status"
+            ;;
+        3)
+            warn "Pi-hole reports adlist status 3 (unavailable source/local copy), but this file:// source was explicitly read and parsed successfully"
+            ;;
+        4)
+            error "Pi-hole reports adlist status 4 (unavailable, no local copy) after gravity"
+            return 1
+            ;;
+        *)
+            warn "Pi-hole returned unrecognized adlist status $api_status; not using status alone as migration failure"
+            ;;
+    esac
+
+    if [[ "$TARGET_ENABLED" == "true" || "$LOCAL_TEST_ENABLED_BY_TXN" == "true" ]]; then
+        [[ "$api_enabled" == "true" ]] || {
+            error "Local adlist is unexpectedly disabled after gravity"
+            return 1
+        }
+    fi
+
+    local_sha="$(sha256sum "$LOCAL_FILE" | awk '{print $1}')"
+    [[ "$local_sha" == "$SOURCE_SHA256" ]] || {
+        error "Active local snapshot checksum changed unexpectedly"
+        return 1
+    }
+
+    journal_write
+    info "Local adlist #$LOCAL_ID verified: exact=$api_number, abp=$api_abp, gravity_rows=$gravity_count, status=$api_status"
+}
+
+set_old_enabled() {
+    local enabled="$1"
+    api_put_record "$TARGET_URL" "$TARGET_TYPE" "$(remote_adlist_body_enabled "$enabled")"
+}
+
+restore_local_file() {
+    if [[ "$LOCAL_FILE_MODIFIED_BY_TXN" == "true" ]]; then
+        if [[ -f "$TXN_DIR/prior-local-file-before-overwrite.txt" ]]; then
+            local mode="${LOCAL_FILE_MODE:-644}"
+            local uid="${LOCAL_FILE_UID:-0}"
+            local gid="${LOCAL_FILE_GID:-0}"
+            install -o "$uid" -g "$gid" -m "$mode" \
+                "$TXN_DIR/prior-local-file-before-overwrite.txt" \
+                "$LOCAL_FILE"
+        elif [[ "$LOCAL_FILE_EXISTED" == "false" ]]; then
+            rm -f -- "$LOCAL_FILE"
+        fi
+    elif [[ "$LOCAL_FILE_CREATED_BY_TXN" == "true" ]]; then
+        rm -f -- "$LOCAL_FILE"
+    fi
+}
+
+restore_original_local() {
+    local body
+    local existing
+
+    if [[ "$LOCAL_RECORD_CREATED_BY_TXN" == "true" ]]; then
+        existing="$(api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE" || true)"
+        if [[ -n "$existing" ]]; then
+            api_delete_record "$LOCAL_URL" "$TARGET_TYPE" || warn "Failed to remove newly created local adlist #$LOCAL_ID during rollback"
+        fi
+        restore_local_file
+        return 0
+    fi
+
+    if [[ "$LOCAL_RECORD_EXISTED" == "true" ]]; then
+        if [[ -n "$ORIGINAL_LOCAL_RECORD_JSON" ]]; then
+            body="$(restore_record_body <<<"$ORIGINAL_LOCAL_RECORD_JSON")"
+            if api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE" >/dev/null 2>&1; then
+                api_put_record "$LOCAL_URL" "$TARGET_TYPE" "$body" || warn "Failed to restore original local adlist metadata"
+            else
+                api_post_record "$TARGET_TYPE" "$body" >/dev/null || warn "Failed to recreate original local adlist"
+            fi
+        fi
+        restore_local_file
+    else
+        existing="$(api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE" || true)"
+        if [[ -n "$existing" ]]; then
+            api_delete_record "$LOCAL_URL" "$TARGET_TYPE" || warn "Failed to remove unexpected local adlist during rollback"
+        fi
+        restore_local_file
+    fi
+}
+
+restore_original_remote_if_deleted() {
+    local existing
+    local body
+
+    existing="$(api_find_exact_record "$TARGET_URL" "$TARGET_TYPE" || true)"
+    if [[ -n "$existing" ]]; then
+        return 0
+    fi
+
+    body="$(restore_record_body <<<"$ORIGINAL_RECORD_JSON")"
+    api_post_record "$TARGET_TYPE" "$body" >/dev/null || {
+        warn "Could not recreate deleted original adlist automatically"
+        return 1
+    }
+
+    info "Recreated original remote adlist during rollback"
+}
+
+verify_rollback_state() {
+    local record
+    local local_record
+    local old_enabled
+    local expected_old_enabled
+    local local_exists
+    local expected_local_exists
+    local expected_file_exists
+    local actual_file_exists
+
+    record="$(api_find_exact_record "$TARGET_URL" "$TARGET_TYPE" || true)"
+    [[ -n "$record" ]] || {
+        error "Rollback verification failed: original remote adlist is missing"
+        return 1
+    }
+
+    old_enabled="$(jq -r 'if .enabled then "true" else "false" end' <<<"$record")"
+    expected_old_enabled="$TARGET_ENABLED"
+    [[ "$old_enabled" == "$expected_old_enabled" ]] || {
+        error "Rollback verification failed: original remote enabled state is $old_enabled, expected $expected_old_enabled"
+        return 1
+    }
+
+    jq -e --argjson original "$ORIGINAL_RECORD_JSON" \
+        '(.address == $original.address) and (.type == $original.type) and ((.enabled // false) == ($original.enabled // false)) and ((.groups // [0]) == ($original.groups // [0])) and ((.comment // null) == ($original.comment // null))' \
+        <<<"$record" >/dev/null || {
+        error "Rollback verification failed: original remote adlist metadata differs"
+        return 1
+    }
+
+    if [[ "$LOCAL_RECORD_EXISTED" == "true" ]]; then
+        local_record="$(api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE" || true)"
+        [[ -n "$local_record" ]] || {
+            error "Rollback verification failed: pre-existing local adlist is missing"
+            return 1
+        }
+        jq -e --argjson original "$ORIGINAL_LOCAL_RECORD_JSON" \
+            '(.address == $original.address) and (.type == $original.type) and ((.enabled // false) == ($original.enabled // false)) and ((.groups // [0]) == ($original.groups // [0])) and ((.comment // null) == ($original.comment // null))' \
+            <<<"$local_record" >/dev/null || {
+            error "Rollback verification failed: pre-existing local adlist metadata differs"
+            return 1
+        }
+        expected_local_exists=1
+    else
+        local_record="$(api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE" || true)"
+        local_exists=0
+        [[ -n "$local_record" ]] && local_exists=1
+        expected_local_exists=0
+        [[ "$local_exists" -eq "$expected_local_exists" ]] || {
+            error "Rollback verification failed: unexpected local adlist remains"
+            return 1
+        }
+    fi
+
+    expected_file_exists="$LOCAL_FILE_EXISTED"
+    actual_file_exists="false"
+    [[ -f "$LOCAL_FILE" ]] && actual_file_exists="true"
+    [[ "$actual_file_exists" == "$expected_file_exists" ]] || {
+        error "Rollback verification failed: local file existence differs from pre-migration state"
+        return 1
+    }
+
+    if [[ "$LOCAL_FILE_EXISTED" == "true" && -f "$TXN_DIR/prior-local-file-before-overwrite.txt" ]]; then
+        cmp -s "$LOCAL_FILE" "$TXN_DIR/prior-local-file-before-overwrite.txt" || {
+            error "Rollback verification failed: local file contents were not restored byte-for-byte"
+            return 1
+        }
+        [[ "$(stat -c '%a' "$LOCAL_FILE")" == "$LOCAL_FILE_MODE" ]] || {
+            error "Rollback verification failed: local file mode was not restored"
+            return 1
+        }
+        [[ "$(stat -c '%u' "$LOCAL_FILE")" == "$LOCAL_FILE_UID" ]] || {
+            error "Rollback verification failed: local file owner was not restored"
+            return 1
+        }
+        [[ "$(stat -c '%g' "$LOCAL_FILE")" == "$LOCAL_FILE_GID" ]] || {
+            error "Rollback verification failed: local file group was not restored"
+            return 1
+        }
+    fi
+
+    info "Rollback verification passed"
+    return 0
+}
+
+rollback_transaction() {
+    local reason="${1:-rollback}"
+    local gravity_ok="true"
+
+    [[ "$MIGRATION_ACTIVE" == "true" ]] || return 0
+    [[ "$ROLLBACK_IN_PROGRESS" == "true" ]] || ROLLBACK_IN_PROGRESS="true"
+
+    error "Rolling back: $reason"
+    journal_mark "rolling_back" 2>/dev/null || true
+
+    if [[ "$OLD_DELETED_BY_TXN" == "true" ]]; then
+        restore_original_remote_if_deleted || true
+    fi
+
+    if [[ -n "$TARGET_URL" && -n "$TARGET_TYPE" ]]; then
+        if ! set_old_enabled "$TARGET_ENABLED"; then
+            warn "Failed to restore original remote adlist enabled state"
+        fi
+    fi
+
+    restore_original_local || true
+
+    if [[ "$ROLLBACK_GRAVITY_REQUIRED" == "true" ]]; then
+        if ! pihole -g >/dev/null 2>&1; then
+            gravity_ok="false"
+            warn "Gravity rebuild during rollback failed"
+        fi
+    fi
+
+    if [[ "$gravity_ok" == "true" ]]; then
+        if ! verify_rollback_state; then
+            error "Rollback completed with verification errors; inspect Pi-hole state manually"
+            journal_mark "rollback_incomplete" 2>/dev/null || true
+            MIGRATION_ACTIVE="false"
+            return 1
+        fi
+        journal_mark "rolledback" 2>/dev/null || true
+    else
+        journal_mark "rollback_incomplete" 2>/dev/null || true
+        MIGRATION_ACTIVE="false"
+        return 1
+    fi
+
+    MIGRATION_ACTIVE="false"
+    ROLLBACK_IN_PROGRESS="false"
+    return 0
+}
+
+ask_delete_old() {
+    local answer
+
+    echo
+    echo "The local replacement passed gravity and database verification."
+    echo "Old remote adlist: #$TARGET_ID"
+    echo "Old URL: $TARGET_URL"
+    echo "Local adlist: #$LOCAL_ID"
+    echo "Local file: $LOCAL_FILE"
+    echo
+    echo "Pre-change archive:"
+    echo "  $ARCHIVE"
+    echo
+    read -rp "Delete the original remote adlist #$TARGET_ID now? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+commit_delete_old() {
+    local remaining
+
+    info "Deleting original remote adlist #$TARGET_ID"
+    OLD_DELETED_BY_TXN="true"
+    # Record the pending deletion before the API call.
+    journal_write
+    api_delete_record "$TARGET_URL" "$TARGET_TYPE" || return 1
+    journal_write
+
+    remaining="$(api_find_exact_record "$TARGET_URL" "$TARGET_TYPE" || true)"
+    [[ -z "$remaining" ]] || {
+        error "Pi-hole still reports the old remote adlist after deletion"
+        return 1
+    }
+
+    info "Original remote adlist deleted"
+}
+
+verify_committed_state() {
+    local record
+    local old
+    local local_enabled
+
+    old="$(api_find_exact_record "$TARGET_URL" "$TARGET_TYPE" || true)"
+    [[ -z "$old" ]] || {
+        error "Committed-state verification failed: old remote adlist still exists"
+        return 1
+    }
+
+    record="$(api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE" || true)"
+    [[ -n "$record" ]] || {
+        error "Committed-state verification failed: local adlist is missing"
+        return 1
+    }
+
+    local_enabled="$(jq -r 'if .enabled then "true" else "false" end' <<<"$record")"
+    if [[ "$TARGET_ENABLED" == "true" ]]; then
+        [[ "$local_enabled" == "true" ]] || {
+            error "Committed-state verification failed: local adlist is disabled"
+            return 1
+        }
+    fi
+
+    info "Committed Pi-hole state verified"
+}
+
+print_state_summary() {
+    local json
+    json="$(api_get_all_lists)" || return 1
+
+    echo
+    echo "Migration records:"
+    jq -r --arg old "$TARGET_URL" --arg local "$LOCAL_URL" '
+        .lists[]
+        | select(.address == $old or .address == $local)
+        | [.id,
+           (if .enabled then "enabled" else "disabled" end),
+           (.number // 0),
+           (.status // 0),
+           .type,
+           .address]
+        | @tsv
+    ' <<<"$json"
+}
+
+finalize_committed_transaction() {
+    ROLLBACK_GRAVITY_REQUIRED="false"
+    TXN_STATUS="committed"
+    journal_write
+    journal_mark "committed"
+    MIGRATION_ACTIVE="false"
+    COMMITTED="true"
+}
+
+cleanup() {
+    local rc=$?
+
+    if [[ "$MIGRATION_ACTIVE" == "true" && "$COMMITTED" != "true" && "$ROLLBACK_IN_PROGRESS" != "true" ]]; then
+        rollback_transaction "Unexpected termination (exit status $rc)" || true
+    elif [[ "$TXN_STATUS" == "prepared" && -n "$TXN_STATE" && -f "$TXN_STATE" ]]; then
+        journal_mark "aborted_before_change" >/dev/null 2>&1 || true
+    fi
+
+    logout_api
+
+    if [[ -n "$LOCK_FD" ]]; then
+        flock -u "$LOCK_FD" >/dev/null 2>&1 || true
+        eval "exec ${LOCK_FD}>&-" >/dev/null 2>&1 || true
+        LOCK_FD=""
+    fi
+
+    return "$rc"
+}
+
+on_signal() {
+    error "Interrupted"
+    if [[ "$MIGRATION_ACTIVE" == "true" && "$COMMITTED" != "true" && "$ROLLBACK_IN_PROGRESS" != "true" ]]; then
+        rollback_transaction "Interrupted by signal" || true
+    fi
+    exit 130
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM HUP
+
+main() {
+    local active_txn=""
+    local normalized=""
+    local answer
+
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        usage
+        return 0
+    fi
+
+    [[ $# -eq 1 ]] || {
+        usage >&2
+        return 2
+    }
+
+    TARGET_URL="$1"
+    check_root
+    check_dependencies
+    acquire_lock
+    validate_target_url
+
+    api_authenticate
+
+    # Recover an interrupted transaction before beginning another one.
+    active_txn="$(find_active_transaction || true)"
+    if [[ -n "$active_txn" ]]; then
+        recover_unfinished_transaction
+    fi
+
+    # Reset target variables in case recovery was performed.
+    TARGET_URL="$1"
+    load_target_record
+
+    LOCAL_FILE="$(make_local_path "$TARGET_URL")"
+    LOCAL_URL="file://$LOCAL_FILE"
+    LOCAL_COMMENT="$(make_managed_comment)"
+    capture_existing_local_record
+
+    # Prepare a persistent transaction journal. No Pi-hole state changes occur
+    # until the source is secured, validated, and archived.
+    new_transaction
+    journal_write
+
+    choose_source
+    validate_source_file
+    journal_write
+
+    build_archive
+    activate_transaction
+
+    # Install local state.
+    install_local_snapshot
+    configure_local_adlist
+    verify_local_record_config
+
+    # Temporarily enable local replacement when the original remote was disabled,
+    # so the source can still be tested with gravity. Its original disabled state
+    # will be restored if the migration commits.
+    if [[ "$TARGET_ENABLED" != "true" ]]; then
+        info "Temporarily enabling local replacement for gravity verification"
+        LOCAL_TEST_ENABLED_BY_TXN="true"
+        journal_write
+        api_put_record "$LOCAL_URL" "$TARGET_TYPE" "$(local_adlist_body_enabled true)" || {
+            rollback_transaction "Could not temporarily enable local replacement"
+            die "Migration aborted; Pi-hole state was restored"
+        }
+        journal_write
+    fi
+
+    if [[ "$TARGET_ENABLED" == "true" ]]; then
+        info "Temporarily disabling old remote adlist #$TARGET_ID"
+        OLD_DISABLED_BY_TXN="true"
+        journal_write
+        set_old_enabled false || {
+            rollback_transaction "Could not disable old remote adlist"
+            die "Migration aborted while disabling old remote adlist"
+        }
+        journal_write
+    else
+        info "Old remote adlist was already disabled; leaving it disabled"
+    fi
+
+    run_gravity || {
+        rollback_transaction "Local gravity verification failed"
+        die "Migration aborted; Pi-hole state was restored"
+    }
+
+    normalized="$TXN_DIR/gravity-normalized.log"
+    verify_gravity_for_local "$normalized" || {
+        rollback_transaction "Local gravity/database/API verification failed"
+        die "Migration aborted; Pi-hole state was restored"
+    }
+
+    # Restore local enabled state when the original remote was disabled.
+    if [[ "$TARGET_ENABLED" != "true" && "$LOCAL_TEST_ENABLED_BY_TXN" == "true" ]]; then
+        info "Restoring local replacement to its original disabled state"
+        journal_write
+        api_put_record "$LOCAL_URL" "$TARGET_TYPE" "$(local_adlist_body_enabled false)" || {
+            rollback_transaction "Could not restore local replacement enabled state"
+            die "Migration aborted; Pi-hole state was restored"
+        }
+        journal_write
+    fi
+
+    if ask_delete_old; then
+        commit_delete_old || {
+            rollback_transaction "Failed to delete/verify original remote adlist"
+            die "Migration aborted; Pi-hole state was restored where possible"
+        }
+
+        info "Running final gravity rebuild"
+        if ! pihole -g >"$TXN_DIR/final-gravity.log" 2>&1; then
+            rollback_transaction "Final gravity failed after deleting original adlist"
+            die "Final gravity failed; rollback was attempted"
+        fi
+
+        if [[ "$TARGET_ENABLED" == "true" ]]; then
+            normalize_gravity_log "$TXN_DIR/final-gravity.log" "$TXN_DIR/final-gravity-normalized.log"
+            # Final verification: old URL absent, local record present/enabled,
+            # and the file checksum remains the source snapshot.
+            if ! grep -F "[i] Target: $LOCAL_URL" "$TXN_DIR/final-gravity-normalized.log" >/dev/null; then
+                rollback_transaction "Final gravity did not process the local replacement"
+                die "Final gravity verification failed; rollback was attempted"
+            fi
+            if ! grep -F "Using local file $LOCAL_FILE" "$TXN_DIR/final-gravity-normalized.log" >/dev/null; then
+                rollback_transaction "Final gravity did not confirm local-file use"
+                die "Final gravity verification failed; rollback was attempted"
+            fi
+            if ! grep -F "Parsed $(printf '%s' "$(jq -r '.number' <<<"$(api_find_exact_record "$LOCAL_URL" "$TARGET_TYPE")")") exact domains" "$TXN_DIR/final-gravity-normalized.log" >/dev/null 2>&1; then
+                warn "Could not match the final gravity parsed-count line exactly; API/gravity verification will be performed"
+            fi
+            verify_gravity_for_local "$TXN_DIR/final-gravity-normalized.log" || {
+                rollback_transaction "Final local-list verification failed"
+                die "Final verification failed; rollback was attempted"
+            }
+        fi
+
+        verify_committed_state || {
+            rollback_transaction "Committed-state verification failed"
+            die "Committed-state verification failed; rollback was attempted"
+        }
+
+        finalize_committed_transaction
+
+        echo
+        echo "Migration committed successfully."
+        echo "  Active adlist : #$LOCAL_ID"
+        echo "  Local file    : $LOCAL_FILE"
+        echo "  Archive       : $ARCHIVE"
+        print_state_summary || true
+        return 0
+    fi
+
+    # User declined deletion: cancel the migration and restore the original state.
+    rollback_transaction "User chose not to delete the original remote adlist" || {
+        die "Migration cancellation requested, but rollback verification failed"
+    }
+
+    echo
+    echo "Migration cancelled. The original Pi-hole configuration was restored."
+    echo "Archive retained: $ARCHIVE"
+    return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
